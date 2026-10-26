@@ -799,14 +799,20 @@ fn extract_zip(archive: &Path, workspace: &Path) -> MedusaResult<PathBuf> {
     let mut candidate = None;
     for index in 0..zip.len() {
         let mut entry = zip.by_index(index).map_err(zip_error)?;
-        let enclosed = entry
-            .enclosed_name()
-            .ok_or_else(|| invalid(format!("unsafe ZIP path {}", entry.name())))?;
+        let enclosed = entry.enclosed_name().ok_or_else(|| {
+            invalid(format!(
+                "unsafe ZIP path {}",
+                entry.name().unwrap_or_default()
+            ))
+        })?;
         let Some(name) = enclosed.file_name() else {
             continue;
         };
-        if !is_medusa_binary(name) || entry.is_dir() {
+        if !is_medusa_binary(name) {
             continue;
+        }
+        if entry.is_dir() || !entry.is_file() {
+            return Err(invalid("Medusa archive entry is not a regular file"));
         }
         if candidate.is_some() {
             return Err(invalid("update ZIP contains multiple Medusa executables"));
@@ -1260,5 +1266,47 @@ mod tests {
                 .extract_archive(&archive_path, &directory.path().join("extract"))
                 .is_err()
         );
+    }
+    #[test]
+    fn zip_directory_binary_is_rejected() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let archive_path = directory.path().join("directory_medusa.zip");
+        let file = fs::File::create(&archive_path).expect("zip");
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .add_directory("medusa", zip::write::SimpleFileOptions::default())
+            .expect("dir entry");
+        writer.finish().expect("finish");
+        assert!(
+            AtomicInstaller::new(directory.path().join("target"))
+                .extract_archive(&archive_path, &directory.path().join("extract"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn zip_suid_bits_are_not_preserved() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let archive_path = directory.path().join("suid.zip");
+        let file = fs::File::create(&archive_path).expect("zip");
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o104755);
+        writer.start_file("medusa", options).expect("entry");
+        writer.write_all(b"binary payload").expect("write");
+        writer.finish().expect("finish");
+
+        let extract_dir = directory.path().join("extract");
+        let candidate = AtomicInstaller::new(directory.path().join("target"))
+            .extract_archive(&archive_path, &extract_dir)
+            .expect("extract candidate");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&candidate).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o4000, 0, "SUID bit must not be preserved");
+            assert_eq!(mode & 0o2000, 0, "SGID bit must not be preserved");
+        }
+        assert!(candidate.is_file());
     }
 }
